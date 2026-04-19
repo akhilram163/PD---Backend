@@ -3,6 +3,9 @@ main.py
 -------
 FastAPI backend for BSEF — Early-Onset Parkinson's Disease Detection.
 
+On startup, trains the model from the dataset files if model.joblib
+doesn't exist yet. This avoids needing to store a large model file on GitHub.
+
 Endpoints:
     GET  /           → health check
     POST /predict    → upload a .wav file, get back a prediction
@@ -18,8 +21,6 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from predict import predict_from_audio, load_model
-
 # ── App setup ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="BSEF — Parkinson's Speech Screening API",
@@ -28,8 +29,6 @@ app = FastAPI(
 )
 
 # ── CORS — allows your React website to talk to this backend ─────────────────
-# During development this allows all origins.
-# Before going fully public, replace "*" with your actual frontend URL.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,16 +36,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load model once at startup (not on every request) ────────────────────────
-MODEL_PATH = Path(__file__).parent / "model.joblib"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).parent
+MODEL_PATH = BASE_DIR / "model.joblib"
+DF1_PATH   = BASE_DIR / "parkinsons.data"
+DF2_PATH   = BASE_DIR / "parkinsons_updrs.data"
+
+# ── Load or train model on startup ───────────────────────────────────────────
+model = None
 
 @app.on_event("startup")
-def load_ml_model():
+def load_or_train_model():
     global model
-    if not MODEL_PATH.exists():
-        raise RuntimeError(f"Model file not found at {MODEL_PATH}")
-    model = load_model(str(MODEL_PATH))
-    print(f"[startup] ✅ Model loaded from {MODEL_PATH}")
+
+    if MODEL_PATH.exists():
+        print("[startup] Loading existing model...")
+        model = joblib.load(str(MODEL_PATH))
+        print("[startup] ✅ Model loaded.")
+    else:
+        print("[startup] model.joblib not found — training from datasets...")
+        if not DF1_PATH.exists() or not DF2_PATH.exists():
+            raise RuntimeError(
+                "Dataset files missing. Make sure parkinsons.data and "
+                "parkinsons_updrs.data are in the repo."
+            )
+        from train import train
+        model = train(str(DF1_PATH), str(DF2_PATH), str(MODEL_PATH))
+        print("[startup] ✅ Model trained and saved.")
 
 # ── Temp folder for uploaded audio files ─────────────────────────────────────
 TEMP_DIR = Path("/tmp/bsef_audio")
@@ -54,10 +70,10 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 # ── Response schema ───────────────────────────────────────────────────────────
 class PredictionResponse(BaseModel):
-    prediction: str           # "Healthy", "Parkinson's Disease", "Early-Onset Parkinson's Disease"
-    confidence: float         # e.g. 91.3  (percentage)
-    probabilities: dict       # {"Healthy": 2.1, "Parkinson's Disease": 6.6, "Early-Onset...": 91.3}
-    biomarkers: dict          # raw extracted feature values
+    prediction: str
+    confidence: float
+    probabilities: dict
+    biomarkers: dict
     disclaimer: str
 
 DISCLAIMER = (
@@ -70,7 +86,6 @@ DISCLAIMER = (
 
 @app.get("/")
 def health_check():
-    """Simple health check — confirms the server is running."""
     return {"status": "ok", "message": "BSEF API is running."}
 
 
@@ -78,19 +93,13 @@ def health_check():
 async def predict(file: UploadFile = File(...)):
     """
     Upload a .wav audio file and receive a Parkinson's screening result.
-
-    - Accepts: .wav files only
-    - Returns: prediction label, confidence, class probabilities, and raw biomarkers
     """
-
-    # ── Validate file type ────────────────────────────────────────────────────
     if not file.filename.endswith(".wav"):
         raise HTTPException(
             status_code=400,
-            detail="Only .wav audio files are accepted. Please convert your recording to .wav format."
+            detail="Only .wav audio files are accepted."
         )
 
-    # ── Save uploaded file to a temp path ─────────────────────────────────────
     temp_filename = TEMP_DIR / f"{uuid.uuid4().hex}.wav"
     try:
         with open(temp_filename, "wb") as buffer:
@@ -98,20 +107,18 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save audio file: {str(e)}")
 
-    # ── Run prediction ─────────────────────────────────────────────────────────
     try:
+        from predict import predict_from_audio
         result = predict_from_audio(str(temp_filename), model)
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Feature extraction or prediction failed: {str(e)}"
+            detail=f"Prediction failed: {str(e)}"
         )
     finally:
-        # Always clean up the temp file
         if temp_filename.exists():
             temp_filename.unlink()
 
-    # ── Return response ────────────────────────────────────────────────────────
     return PredictionResponse(
         prediction=result.label,
         confidence=round(result.confidence * 100, 1),
